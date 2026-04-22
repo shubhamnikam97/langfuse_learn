@@ -7,12 +7,14 @@ from typing import List, Dict, Any, Optional
 import uuid
 import time
 import traceback
-from langfuse import observe
+# from chromadb.app import settings
+# from langfuse import get_client, Langfuse
+from core.langfuse_client import langfuse
 
 from ingestion.processors.chunker import TextChunker
 from embedding.client import EmbeddingClient
 from vectorstore.factory import get_vector_store
-from core.langfuse_client import langfuse_client
+from core.config import get_settings
 from ingestion.loaders.loader_factory import get_loader
 
 class IngestionPipeline:
@@ -24,13 +26,28 @@ class IngestionPipeline:
         self.chunker = TextChunker()
         self.embedding_client = EmbeddingClient()
         self.vector_store = get_vector_store()
+        self.settings = get_settings()
+        
+        self.langfuse = langfuse
+        # # self.langfuse = get_client() if getattr(self.settings, "langfuse_enabled", False) else None
+        # Langfuse(
+        #     public_key=self.settings.langfuse_public_key,
+        #     secret_key=self.settings.langfuse_secret_key,
+        #     host=self.settings.langfuse_host 
+        # )
+        # # self.langfuse = get_client() if getattr(self.settings, "langfuse_enabled", False) else None
+        # self.langfuse = (
+        #     get_client()
+        #     if self.settings.langfuse_public_key and self.settings.langfuse_secret_key
+        #     else None
+        # )
 
-    @observe(name="ingest_documents")
+    # =========================
+    # DOCUMENT INGESTION
+    # =========================
     def ingest_documents(
         self,
-        # documents: List[Dict[str, Any]],
         documents: List[str],
-        # metadata: Optional[List[Dict[str, Any]]] = None
         metadatas: Optional[List[Dict[str, Any]]] = None
     ) -> None:
         """
@@ -44,24 +61,66 @@ class IngestionPipeline:
             return
         
         start_time = time.time()
-        
-        # Create langfuse trace
-        # trace = None
-        # if langfuse_client.enabled:
-        #     trace = langfuse_client.trace(
-        #         name="ingestion_pipeline",
-        #         metadata={
-        #             "num_documents": len(documents),
-        #         }
-        #     )
 
         try:
-            all_chunks = []
-            all_metadatas = []
+            # =========================
+            # ROOT SPAN
+            # =========================
+            if self.langfuse:
+                with self.langfuse.start_as_current_observation(
+                    name="ingestion_pipeline",
+                    as_type="span",
+                    input={"num_documents": len(documents)},
+                ) as root_span:
+                    self._process_documents(documents, metadatas, root_span, start_time)
+                
+                self.langfuse.flush()
+            else:
+                self._process_documents(documents, metadatas, None, start_time)
 
+        except Exception as e:
+            traceback.print_exc()
+            raise e
+    
+    # =========================
+    # INTERNAL PROCESSING
+    # =========================
+    def _process_documents(
+        self,
+        documents: List[str],
+        metadatas: Optional[List[Dict[str, Any]]],
+        root_span,
+        start_time: float
+    ):
+        all_chunks = []
+        all_metadatas = []
+
+        # -------------------------
+        # CHUNKING
+        # -------------------------
+        if self.langfuse:
+            with self.langfuse.start_as_current_observation(
+                name="chunking",
+                as_type="span",
+            ) as span:
+                
+                for i, doc in enumerate(documents):
+                    chunks = self.chunker.split_text(doc)
+                    # print("chunks:", chunks)
+                    if not chunks:
+                        continue
+
+                    for chunk in chunks:
+                        all_chunks.append(chunk)
+
+                        if metadatas and i < len(metadatas):
+                            all_metadatas.append(metadatas[i])
+                        else:
+                            all_metadatas.append({})
+            self.langfuse.flush()
+        else:
             for i, doc in enumerate(documents):
                 chunks = self.chunker.split_text(doc)
-                # print("chunks:", chunks)
                 if not chunks:
                     continue
 
@@ -73,33 +132,52 @@ class IngestionPipeline:
                     else:
                         all_metadatas.append({})
 
-            # Log chunking
-            # if trace:
-            #     trace.span(
-            #         name="chunking",
-            #         input={"documents": len(documents)},
-            #         output={"num_chunks": len(all_chunks)},
-            #     )
+        if not all_chunks:
+            return
 
-            if not all_chunks:
-                return
+        # -------------------------
+        # EMBEDDING
+        # -------------------------
+        if self.langfuse:
+            with self.langfuse.start_as_current_observation(
+                name="embedding",
+                as_type="span",
+            ) as span:
 
+                embeddings = self.embedding_client.embed_texts(all_chunks)
 
-            # Generate embeddings
+                span.update(
+                    output={
+                        "num_embeddings": len(embeddings),
+                        "embedding_dim": len(embeddings[0]) if embeddings else 0,
+                    }
+                )
+            self.langfuse.flush()
+        else:
             embeddings = self.embedding_client.embed_texts(all_chunks)
 
-            # Log embeddings
-            # if trace:
-            #     trace.span(
-            #         name="embedding",
-            #         input={"num_chunks": len(all_chunks)},
-            #         output={"embedding_dim": len(embeddings[0]) if embeddings else 0},
-            #     )
+        # -------------------------
+        # STORAGE
+        # -------------------------
+        if self.langfuse:
+            with self.langfuse.start_as_current_observation(
+                name="vector_store",
+                as_type="span",
+            ) as span:
 
-            # Generate unique IDs
+                ids = [str(uuid.uuid4()) for _ in all_chunks]
+
+                self.vector_store.add_documents(
+                    texts=all_chunks,
+                    embeddings=embeddings,
+                    metadatas=all_metadatas,
+                    ids=ids
+                )
+
+                span.update(output={"num_vectors": len(all_chunks)})
+        else:
             ids = [str(uuid.uuid4()) for _ in all_chunks]
 
-            # store in vector DB
             self.vector_store.add_documents(
                 texts=all_chunks,
                 embeddings=embeddings,
@@ -107,42 +185,31 @@ class IngestionPipeline:
                 ids=ids
             )
 
-            # Log storage
-            # if trace:
-            #     trace.span(
-            #         name="vector_store",
-            #         output={
-            #             "num_vectors": len(all_chunks),
-            #             # "collection": "chroma"
-            #         },
-            #     )
+        # -------------------------
+        # PERSIST
+        # -------------------------
+        try:
+            self.vector_store.persist()
+        except Exception:
+            pass
 
-            try:
-                # Persist changes
-                self.vector_store.persist()
-            except Exception:
-                pass
+        latency = round(time.time() - start_time, 3)
 
-            latency = round(time.time() - start_time, 3)
+        if root_span:
+            root_span.update(
+                output={
+                    "status": "success",
+                    "num_chunks": len(all_chunks),
+                    "latency": latency,
+                }
+            )
 
-            # Final trace update
-            # if trace:
-            #     trace.update(
-            #         output={
-            #             "status": "success",
-            #             "total_chunks": len(all_chunks),
-            #             "latency": latency,
-            #         }
-            #     )
 
-        except Exception as e:
-            traceback.print_exc()
 
-            # if trace:
-            #     trace.update(output={"error": str(e)})
-            raise e
-    
-    @observe(name="ingest_files")
+
+    # =========================
+    # FILE INGESTION
+    # =========================
     def ingest_files(
         self,
         file_paths: List[str],
@@ -154,16 +221,6 @@ class IngestionPipeline:
             return
         
         start_time = time.time()
-
-        # # Langfuse Trace
-        # if langfuse_client.enabled:
-        #     trace = langfuse_client.trace(
-        #         name="file_ingestion_pipeline",
-        #         metadata={
-        #             "num_files": len(file_paths),
-        #             # "files": file_paths,
-        #         }
-        #     )
 
         all_documents = []
         all_metadatas = []
@@ -181,20 +238,7 @@ class IngestionPipeline:
                     all_metadatas.append({"source": path})
 
             except Exception as e:
-                # if trace:
-                #     trace.span(
-                #         name="loader_error",
-                #         input={"file": path},
-                #         output={"error": str(e)},
-                #     )
                 continue
-        
-        # if trace:
-        #     trace.span(
-        #         name="loading",
-        #         input={"file_paths": file_paths},
-        #         output={"num_documents": len(all_documents)},
-        #     )
             
         self.ingest_documents(
             documents=all_documents,
@@ -202,15 +246,6 @@ class IngestionPipeline:
         )
 
         latency = round(time.time() - start_time, 3)
-
-        # if trace:
-        #     trace.update(
-        #         output={
-        #             "status": "success",
-        #             "total_documents": len(all_documents),
-        #             "latency": latency,
-        #         }
-        #     )
             
 
 # Optional Instance
