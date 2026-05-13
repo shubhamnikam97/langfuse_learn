@@ -2,7 +2,8 @@ import streamlit as st
 import requests
 
 # Backend API URL
-API_URL = "http://127.0.0.1:8000/api"
+# API_URL = "http://127.0.0.1:8000/api"
+API_URL = "http://backend:8000/api"
 
 st.set_page_config(
     page_title="Rag App",
