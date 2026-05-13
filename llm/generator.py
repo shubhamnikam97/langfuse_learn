@@ -14,6 +14,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from core.config import get_settings
 from core.langfuse_client import langfuse
+from evaluation.ragas_evaluator import RAGASEvaluator
+import re
 
 class ResponseGenerator:
     """
@@ -25,6 +27,10 @@ class ResponseGenerator:
         self.model = self.settings.openai_llm_model
 
         self.langfuse = langfuse
+        self.evaluator = RAGASEvaluator(
+            model=self.model,
+            api_key=self.settings.openai_api_key,
+        )
 
     # -------------------------
     # CONTEXT
@@ -46,8 +52,16 @@ class ResponseGenerator:
         for i, d in enumerate(docs, 1):
             text = d.get('text', '')
             meta = d.get('metadata') or {}
-            source = meta.get("source") or "unknown"
-            parts.append(f"[Chunk {i} | source={source}]\n{text}")
+            source = meta.get("source", "unknown")
+            page = meta.get("page", "NA")
+            doc_type = meta.get("type", "text")
+            # parts.append(f"[Chunk {i} | source={source}]\n{text}")
+            # parts.append(
+            #     f"[Chunk {i} | source={source} | page={meta.get('page')}]\n{text}"
+            # )
+            parts.append(
+                f"[CHUNK_ID: {i} | SOURCE: {source} | PAGE: {page} | TYPE: {doc_type}]\n{text}"
+            )
         return "\n\n".join(parts)
 
     # -------------------------
@@ -63,7 +77,7 @@ class ResponseGenerator:
         Construct chat messages for the LLM.
         """
         system = system_prompt or (
-            "You are a helpful assistant. Answer the user's question using ONLY the provided context. "
+            "You are a helpful assistant. Answer the user's question using ONLY the provided context. Always cite like [Chunk X]"
             "If the answer is not in the context, say you don't know. Be concise and cite chunk numbers when useful."
         )
 
@@ -174,6 +188,28 @@ class ResponseGenerator:
             return json.loads(response.choices[0].message.content)
         except:
             return {"score": 0, "reason": "parse_error"}
+        
+    def validate_citations(
+        self,
+        answer: str,
+        num_chunks: int
+    ) -> Dict[str, Any]:
+        """
+        Check if model used valid chunk IDs
+        """
+
+        found = re.findall(r"\[CHUNK_ID:\s*(\d+)\]", answer)
+
+        if not found:
+            return {"valid": False, "reason": "no_citations"}
+
+        invalid = [int(i) for i in found if int(i) > num_chunks]
+
+        return {
+            "valid": len(invalid) == 0,
+            "invalid_ids": invalid,
+            "total_citations": len(found)
+        }
     
     def judge_response_llm(
         self,
@@ -275,15 +311,27 @@ class ResponseGenerator:
                     latency = round(time.time() - start_time, 3)
 
                     # =========================
-                    # EVALUATION
+                    # LANGFUSE EVALUATION
                     # =========================
                     evaluation = self.evaluate_response(content, context)
+
+                    citation_eval = self.validate_citations(content, len(docs))
+
                     # LLM-as-a-Judge
                     judge_eval = self.judge_response_llm(query, content, context)
                     # Context Relevance
                     context_eval = self.evaluate_context_relevance(query, context)
                     # Faithfulness
                     faithfulness_eval = self.evaluate_faithfulness(content, context)
+
+                    # =========================
+                    # RAGAS STYLE EVALUATION
+                    # =========================
+                    ragas_eval = self.evaluator.evaluate(
+                        query=query,
+                        answer=content,
+                        context=context,
+                    )
 
                     # Log everything
                     gen.update(
@@ -294,7 +342,9 @@ class ResponseGenerator:
                             "evaluation": evaluation,
                             "judge_eval": judge_eval,
                             "context_eval": context_eval,
+                            "citation_eval": citation_eval,
                             "faithfulness_eval": faithfulness_eval,
+                            "ragas_eval": ragas_eval
                         },
                     )
                     
@@ -336,10 +386,31 @@ class ResponseGenerator:
                             name="answer_length",
                             value=len(content)
                         )
+                    
+                    if ragas_eval:
+                        gen.score(
+                            name="context_precision",
+                            value=ragas_eval["context_precision"]["score"],
+                        )
 
-                        gen.end()
+                        gen.score(
+                            name="context_recall",
+                            value=ragas_eval["context_recall"]["score"],
+                        )
 
-                print("llm_generation")  
+                        gen.score(
+                            name="faithfulness",
+                            value=ragas_eval["faithfulness"]["score"],
+                        )
+
+                        gen.score(
+                            name="answer_relevance",
+                            value=ragas_eval["answer_relevance"]["score"],
+                        )
+
+                    gen.end()
+
+                # print("llm_generation")  
                 self.langfuse.flush()
             else:
                 # Without Langfuse
@@ -360,7 +431,7 @@ class ResponseGenerator:
 
                 latency = round(time.time() - start_time, 3)
                 evaluation = self.evaluate_response(content, context)
-                print("not llm_generation")
+                # print("not llm_generation")
             return {
                 "answer": content,
                 "context": context,
